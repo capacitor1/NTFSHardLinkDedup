@@ -69,6 +69,16 @@ namespace NTFSHardLinkDedup.Src
             double mbps = bytesPerSecond / 1024d / 1024d;
             return $"{mbps:F2} MB/s";
         }
+        public static string FormatBytes(ulong bytes)
+        {
+            string[] suffixes = ["B", "KB", "MB", "GB", "TB"];
+            int i;
+            for (i = 0; i < suffixes.Length && bytes >= 1024; i++)
+            {
+                bytes /= 1024;
+            }
+            return $"{bytes:F4} {suffixes[i]}";
+        }
         public static void EnsureNormalForReplace(string path)
         {
             FileAttributes attrs = File.GetAttributes(path);

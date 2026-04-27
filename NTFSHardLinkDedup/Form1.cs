@@ -551,9 +551,9 @@ namespace NTFSHardLinkDedup
                     ReadOnlySpan<byte> span = bytes;
                     if (searcher.TryFindByHash(span, out var byHash))
                     {
-                        V_ResultsC.Text = $"Result: {byHash!.Count:N0} results!";
                         var data = new List<HashRow>(byHash!.Count);
                         Span<byte> hash = stackalloc byte[32];
+                        ulong total = 0;
                         foreach (var item in byHash!)
                         {
                             //ui
@@ -564,9 +564,10 @@ namespace NTFSHardLinkDedup
                                 FilePath = item.Path,
                                 SizeBytes = item.Size
                             });
-
+                            total += item.Size;
                         }
                         _rows = data;
+                        V_ResultsC.Text = $"Result: {byHash!.Count:N0} results! ({total:N0} B, {Util.FormatBytes(total)})";
                     }
                     else
                     {
@@ -582,9 +583,9 @@ namespace NTFSHardLinkDedup
             {
                 if (searcher.TryFindByPath(V_S_Keywords.Text[2..].AsSpan(), out var byPath))
                 {
-                    V_ResultsC.Text = $"Result: {byPath!.Count:N0} results!";
                     var data = new List<HashRow>(byPath!.Count);
                     Span<byte> hash = stackalloc byte[32];
+                    ulong total = 0;
                     foreach (var item in byPath!)
                     {
                         //ui
@@ -595,9 +596,10 @@ namespace NTFSHardLinkDedup
                             FilePath = item.Path,
                             SizeBytes = item.Size
                         });
-
+                        total += item.Size;
                     }
                     _rows = data;
+                    V_ResultsC.Text = $"Result: {byPath!.Count:N0} results! ({total:N0} B, {Util.FormatBytes(total)})";
                 }
                 else
                 {
@@ -608,9 +610,9 @@ namespace NTFSHardLinkDedup
             {
                 //common keywords
                 SearchResult sr = searcher.FindByKeyword(V_S_Keywords.Text);
-                V_ResultsC.Text = sr.ExceededMaxResults ? $"Result: {sr.Items.Count:N0} (Hit: {sr.ScannedHitCount:N0}) (Warn:Max results exceeded.)" : $"Result: {sr.Items.Count:N0} (Hit: {sr.ScannedHitCount:N0})";
                 var data = new List<HashRow>(sr.Items.Count);
                 Span<byte> hash = stackalloc byte[32];
+                ulong total = 0;
                 foreach (var item in sr.Items)
                 {
                     //ui
@@ -621,10 +623,12 @@ namespace NTFSHardLinkDedup
                         FilePath = item.Path,
                         SizeBytes = item.Size
                     });
-
+                    total += item.Size;
                 }
                 _rows = data;
-
+                V_ResultsC.Text = sr.ExceededMaxResults
+                    ? $"Result: {sr.Items.Count:N0} (Hit: {sr.ScannedHitCount:N0}) ({total:N0} B, {Util.FormatBytes(total)}) (Warn:Max results exceeded.)"
+                    : $"Result: {sr.Items.Count:N0} (Hit: {sr.ScannedHitCount:N0}) ({total:N0} B, {Util.FormatBytes(total)})";
             }
             V_S_Result.VirtualListSize = _rows.Count;
             V_S_Result.Invalidate();
