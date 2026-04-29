@@ -471,7 +471,7 @@
             V_Count.Name = "V_Count";
             V_Count.Size = new Size(350, 17);
             V_Count.TabIndex = 12;
-            V_Count.Text = ".";
+            V_Count.Text = "Ready";
             V_Count.TextAlign = ContentAlignment.TopRight;
             // 
             // V_ResultsC
@@ -609,7 +609,7 @@
             V_S_Keywords.Location = new Point(6, 22);
             V_S_Keywords.MaxLength = 65536;
             V_S_Keywords.Name = "V_S_Keywords";
-            V_S_Keywords.PlaceholderText = "Input keywords(AND: space,OR: |,Wholematch: \"...\") . (pattern: H| + Sha256 to search sha256, P| + path to search full path, * to show all) ";
+            V_S_Keywords.PlaceholderText = "Input keywords(AND: space,OR: |,Wholematch: \"...\") . (pattern: H| + Sha256 to search sha256, * to show all) ";
             V_S_Keywords.Size = new Size(932, 23);
             V_S_Keywords.TabIndex = 0;
             V_S_Keywords.KeyDown += V_S_Keywords_KeyDown;

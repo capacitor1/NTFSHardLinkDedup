@@ -69,7 +69,7 @@ namespace NTFSHardLinkDedup.Src
             double mbps = bytesPerSecond / 1024d / 1024d;
             return $"{mbps:F2} MB/s";
         }
-        public static string FormatBytes(ulong bytes)
+        public static string FormatBytes(decimal bytes)
         {
             string[] suffixes = ["B", "KB", "MB", "GB", "TB"];
             int i;

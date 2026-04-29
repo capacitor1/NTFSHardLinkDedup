@@ -1,85 +1,45 @@
 ﻿using System;
-using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.IO;
-using System.IO.MemoryMappedFiles;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace NTFSHardLinkDedup.Src
 {
-    public sealed class HashListSearcher : IDisposable
+    public sealed class HashListSearcher(
+        string sourcePath,
+        HashListSearcher.HashListInfo info,
+        HashListSearcher.EntryRecord[] entries,
+        string[] paths,
+        int[] pathEntryIds,
+        FrozenDictionary<Hash256, int> hashToEntryId) : IDisposable
     {
         private static readonly UTF8Encoding Utf8 = new UTF8Encoding(false);
 
-        private readonly FileStream _stream;
-        private readonly MemoryMappedFile _mmf;
-        private readonly MemoryMappedViewAccessor _pathBlobAccessor;
-
-        private readonly long _dataAreaStart;
-        private readonly HashListHeader _header;
-        private readonly EntryIndexRecord[] _entryIndex;
-        private readonly PathIndexRecord[] _pathIndex;
-        private readonly Dictionary<Hash256, int> _hashToEntryId;
-
-        private byte[] _buffer;
-        private byte[] _keywordBuffer;
+        private readonly string _sourcePath = sourcePath;
+        private readonly HashListInfo _info = info;
+        private readonly EntryRecord[] _entries = entries;
+        private readonly string[] _paths = paths;
+        private readonly int[] _pathEntryIds = pathEntryIds;
+        private readonly FrozenDictionary<Hash256, int> _hashToEntryId = hashToEntryId;
 
         public int MaxResult { get; set; } = 20_000;
+
+        private static class ChunkIds
+        {
+            public static ReadOnlySpan<byte> HVER => "HVER"u8;
+            public static ReadOnlySpan<byte> HCNT => "HCNT"u8;
+            public static ReadOnlySpan<byte> HREC => "HREC"u8;
+            public static ReadOnlySpan<byte> HASH => "HASH"u8;
+        }
 
         private static class FormatConstants
         {
             public static ReadOnlySpan<byte> Magic => "HashList"u8;
-
-            public const int Version = 3;
-
-            public const int HeaderFixedSize =
-                4 + 4 + 4 + 4 +
-                8 + 8 +
-                8 + 8 +
-                8 + 8;
-
-            public const int EntryIndexRecordSize = 32 + 8 + 4 + 4;
-            public const int PathIndexRecordSize = 8 + 4 + 4;
-        }
-
-        public readonly struct HashListHeader(
-            int version,
-            int flags,
-            int entryCount,
-            int pathCount,
-            long entryIndexOffset,
-            long entryIndexLength,
-            long pathIndexOffset,
-            long pathIndexLength,
-            long pathBlobOffset,
-            long pathBlobLength)
-        {
-            public readonly int Version = version;
-            public readonly int Flags = flags;
-            public readonly int EntryCount = entryCount;
-            public readonly int PathCount = pathCount;
-            public readonly long EntryIndexOffset = entryIndexOffset;
-            public readonly long EntryIndexLength = entryIndexLength;
-            public readonly long PathIndexOffset = pathIndexOffset;
-            public readonly long PathIndexLength = pathIndexLength;
-            public readonly long PathBlobOffset = pathBlobOffset;
-            public readonly long PathBlobLength = pathBlobLength;
-        }
-
-        public readonly struct EntryIndexRecord(Hash256 hash, ulong size, int pathStartIndex, int pathCount)
-        {
-            public readonly Hash256 Hash = hash;
-            public readonly ulong Size = size;
-            public readonly int PathStartIndex = pathStartIndex;
-            public readonly int PathCount = pathCount;
-        }
-
-        public readonly struct PathIndexRecord(long pathBlobOffset, int pathByteLength, int entryId)
-        {
-            public readonly long PathBlobOffset = pathBlobOffset;
-            public readonly int PathByteLength = pathByteLength;
-            public readonly int EntryId = entryId;
+            public const int Version = 1;
         }
 
         public readonly struct HashPathPair(Hash256 hash, string path, ulong size)
@@ -89,75 +49,38 @@ namespace NTFSHardLinkDedup.Src
             public readonly ulong Size = size;
         }
 
-        public readonly struct SearchResult(List<HashListSearcher.HashPathPair> items, bool exceededMaxResults, int scannedHitCount)
+        public readonly struct SearchResult(List<HashPathPair> items, bool exceededMaxResults, int scannedHitCount)
         {
             public readonly bool ExceededMaxResults = exceededMaxResults;
             public readonly int ScannedHitCount = scannedHitCount;
             public readonly List<HashPathPair> Items = items;
         }
 
-        public int EntryCount => _entryIndex.Length;
-
-        public HashListSearcher(string filePath, int fileBufferSize = 1 << 20, int initialBufferSize = 4096)
+        public readonly struct HashListInfo(int hashCount, int fileCount)
         {
-            _stream = new FileStream(
-                filePath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.Read,
-                fileBufferSize,
-                FileOptions.SequentialScan | FileOptions.RandomAccess);
-
-            _mmf = MemoryMappedFile.CreateFromFile(
-                _stream,
-                mapName: null,
-                capacity: 0,
-                MemoryMappedFileAccess.Read,
-                HandleInheritability.None,
-                leaveOpen: true);
-
-            Span<byte> magic = stackalloc byte[8];
-            Span<byte> i64 = stackalloc byte[8];
-
-            ReadExact(_stream, magic);
-            if (!magic.SequenceEqual(FormatConstants.Magic))
-                throw new InvalidDataException("Invalid magic.");
-
-            ReadExact(_stream, i64);
-            long dataLength = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-            _dataAreaStart = 16;
-            if (_stream.Length < _dataAreaStart + dataLength)
-                throw new InvalidDataException("Invalid dataLength.");
-
-            _header = ReadHeader(_stream);
-            _entryIndex = ReadEntryIndex(_stream, _dataAreaStart, _header);
-            _pathIndex = ReadPathIndex(_stream, _dataAreaStart, _header);
-
-            _hashToEntryId = new Dictionary<Hash256, int>(_entryIndex.Length);
-            for (int i = 0; i < _entryIndex.Length; i++)
-                _hashToEntryId[_entryIndex[i].Hash] = i;
-
-            _pathBlobAccessor = _mmf.CreateViewAccessor(
-                _dataAreaStart + _header.PathBlobOffset,
-                _header.PathBlobLength,
-                MemoryMappedFileAccess.Read);
-
-            _buffer = ArrayPool<byte>.Shared.Rent(initialBufferSize);
-            _keywordBuffer = ArrayPool<byte>.Shared.Rent(initialBufferSize);
+            public readonly int HashCount = hashCount;
+            public readonly int FileCount = fileCount;
         }
-        public (int HashCount, int FileCount) GetCounts()
+
+        public readonly struct EntryRecord(Hash256 hash, ulong size, int pathStartIndex, int pathCount)
         {
-            int hashCount = _entryIndex.Length;
-            int fileCount = 0;
+            public readonly Hash256 Hash = hash;
+            public readonly ulong Size = size;
+            public readonly int PathStartIndex = pathStartIndex;
+            public readonly int PathCount = pathCount;
+        }
 
-            for (int i = 0; i < _entryIndex.Length; i++)
-            {
-                ref readonly EntryIndexRecord rec = ref _entryIndex[i];
-                fileCount += rec.PathCount;
-            }
+        public int EntryCount => _entries.Length;
 
-            return (hashCount, fileCount);
+        public string SourcePath => _sourcePath;
+
+        public static async Task<HashListSearcher> OpenAsync(string filePath, CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(filePath))
+                throw new ArgumentException("Path is null or empty.", nameof(filePath));
+
+            byte[] fileBytes = await File.ReadAllBytesAsync(filePath, cancellationToken).ConfigureAwait(false);
+            return Parse(filePath, fileBytes);
         }
 
         public static bool IsValidFile(string hashListPath)
@@ -167,24 +90,14 @@ namespace NTFSHardLinkDedup.Src
 
             try
             {
-                var fi = new FileInfo(hashListPath);
-                if (!fi.Exists)
+                if (!File.Exists(hashListPath))
                     return false;
 
-                long minLen = 8 + 8 + FormatConstants.HeaderFixedSize;
-                if (fi.Length < minLen)
+                using var fs = new FileStream(hashListPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                if (fs.Length < 16)
                     return false;
-
-                using var fs = new FileStream(
-                    hashListPath,
-                    FileMode.Open,
-                    FileAccess.Read,
-                    FileShare.Read,
-                    4096,
-                    FileOptions.SequentialScan);
 
                 Span<byte> magic = stackalloc byte[8];
-                Span<byte> i32 = stackalloc byte[4];
                 Span<byte> i64 = stackalloc byte[8];
 
                 ReadExact(fs, magic);
@@ -193,87 +106,21 @@ namespace NTFSHardLinkDedup.Src
 
                 ReadExact(fs, i64);
                 long dataLength = BinaryPrimitives.ReadInt64LittleEndian(i64);
-                if (dataLength < FormatConstants.HeaderFixedSize)
+                if (dataLength < 0 || fs.Length < 16 + dataLength)
                     return false;
 
-                if (fs.Length < 16 + dataLength)
-                    return false;
+                byte[] payload = new byte[dataLength];
+                ReadExact(fs, payload);
 
-                ReadExact(fs, i32);
-                int version = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-                ReadExact(fs, i32);
-                int flags = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-                ReadExact(fs, i32);
-                int entryCount = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-                ReadExact(fs, i32);
-                int pathCount = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-                ReadExact(fs, i64);
-                long entryIndexOffset = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-                ReadExact(fs, i64);
-                long entryIndexLength = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-                ReadExact(fs, i64);
-                long pathIndexOffset = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-                ReadExact(fs, i64);
-                long pathIndexLength = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-                ReadExact(fs, i64);
-                long pathBlobOffset = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-                ReadExact(fs, i64);
-                long pathBlobLength = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-                if (version != FormatConstants.Version)
-                    return false;
-
-                if (flags < 0 || entryCount < 0 || pathCount < 0)
-                    return false;
-
-                if (entryIndexOffset < 0 || entryIndexLength < 0 ||
-                    pathIndexOffset < 0 || pathIndexLength < 0 ||
-                    pathBlobOffset < 0 || pathBlobLength < 0)
-                    return false;
-
-                if (entryIndexLength != (long)entryCount * FormatConstants.EntryIndexRecordSize)
-                    return false;
-
-                if (pathIndexLength != (long)pathCount * FormatConstants.PathIndexRecordSize)
-                    return false;
-
-                if (entryIndexOffset != FormatConstants.HeaderFixedSize)
-                    return false;
-
-                if (pathIndexOffset != entryIndexOffset + entryIndexLength)
-                    return false;
-
-                if (pathBlobOffset != pathIndexOffset + pathIndexLength)
-                    return false;
-
-                if (entryIndexOffset + entryIndexLength > dataLength)
-                    return false;
-
-                if (pathIndexOffset + pathIndexLength > dataLength)
-                    return false;
-
-                if (pathBlobOffset + pathBlobLength > dataLength)
-                    return false;
-
-                if (dataLength != pathBlobOffset + pathBlobLength)
-                    return false;
-
-                return true;
+                return ValidateChunks(payload);
             }
             catch
             {
                 return false;
             }
         }
+
+        public HashListInfo GetCounts() => _info;
 
         public bool TryFindByHash(ReadOnlySpan<byte> hash, out List<HashPathPair>? items)
         {
@@ -291,74 +138,27 @@ namespace NTFSHardLinkDedup.Src
             return true;
         }
 
-        public bool TryFindByPath(ReadOnlySpan<char> path, out List<HashPathPair>? items)
-        {
-            int byteCount = Utf8.GetByteCount(path);
-            EnsureKeywordCapacity(byteCount);
-            int encoded = Utf8.GetBytes(path, _keywordBuffer);
-
-            int pathId = FindExactPathId(_keywordBuffer.AsSpan(0, encoded));
-            if (pathId < 0)
-            {
-                items = null;
-                return false;
-            }
-
-            int entryId = _pathIndex[pathId].EntryId;
-            items = ExpandEntryToPairs(entryId);
-            return true;
-        }
-        private SearchResult FindAll()
-        {
-            var items = new List<HashPathPair>(Math.Min(MaxResult, 256));
-            bool exceeded = false;
-            int matchedCount = 0;
-
-            for (int pathId = 0; pathId < _pathIndex.Length; pathId++)
-            {
-                ref readonly PathIndexRecord rec = ref _pathIndex[pathId];
-                matchedCount++;
-
-                if (items.Count >= MaxResult)
-                {
-                    exceeded = true;
-                    break;
-                }
-
-                string path = ReadPathString(pathId);
-                ref readonly EntryIndexRecord entry = ref _entryIndex[rec.EntryId];
-                items.Add(new HashPathPair(entry.Hash, path, entry.Size));
-            }
-
-            return new SearchResult(items, exceededMaxResults: exceeded, scannedHitCount: matchedCount);
-        }
         public SearchResult FindByKeyword(ReadOnlySpan<char> keyword)
         {
             string pattern = keyword.ToString().Trim();
-            // 特殊规则：单独一个 * 表示显示全部
-            if ((pattern.Length == 1 && pattern[0] == '*') || pattern == string.Empty)
-            {
+
+            if (pattern.Length == 1 && pattern[0] == '*')
                 return FindAll();
-            }
+
             var groups = ParseKeywordPattern(pattern);
 
             var items = new List<HashPathPair>(Math.Min(MaxResult, 256));
             if (groups.Count == 0)
-                return new SearchResult(items, exceededMaxResults: false, scannedHitCount: 0);
+                return new SearchResult(items, false, 0);
 
             int matchedCount = 0;
             bool exceeded = false;
 
-            for (int pathId = 0; pathId < _pathIndex.Length; pathId++)
+            for (int pathId = 0; pathId < _paths.Length; pathId++)
             {
-                ref readonly PathIndexRecord rec = ref _pathIndex[pathId];
+                string path = _paths[pathId];
 
-                EnsureBufferCapacity(rec.PathByteLength);
-                _pathBlobAccessor.ReadArray(rec.PathBlobOffset, _buffer, 0, rec.PathByteLength);
-
-                ReadOnlySpan<byte> pathBytes = _buffer.AsSpan(0, rec.PathByteLength);
-
-                if (!MatchesKeywordPattern(pathBytes, groups))
+                if (!MatchesKeywordPattern(path, groups))
                     continue;
 
                 matchedCount++;
@@ -369,17 +169,16 @@ namespace NTFSHardLinkDedup.Src
                     break;
                 }
 
-                string path = Utf8.GetString(_buffer, 0, rec.PathByteLength);
-                ref readonly EntryIndexRecord entry = ref _entryIndex[rec.EntryId];
+                ref readonly EntryRecord entry = ref _entries[_pathEntryIds[pathId]];
                 items.Add(new HashPathPair(entry.Hash, path, entry.Size));
             }
 
-            return new SearchResult(items, exceededMaxResults: exceeded, scannedHitCount: matchedCount);
+            return new SearchResult(items, exceeded, matchedCount);
         }
 
         public bool TryGetEntryById(int entryId, out Hash256 hash, out ulong size, out string[]? paths)
         {
-            if ((uint)entryId >= (uint)_entryIndex.Length)
+            if ((uint)entryId >= (uint)_entries.Length)
             {
                 hash = default;
                 size = 0;
@@ -387,45 +186,39 @@ namespace NTFSHardLinkDedup.Src
                 return false;
             }
 
-            ref readonly EntryIndexRecord rec = ref _entryIndex[entryId];
+            ref readonly EntryRecord rec = ref _entries[entryId];
             hash = rec.Hash;
             size = rec.Size;
 
             var arr = new string[rec.PathCount];
-            for (int i = 0; i < rec.PathCount; i++)
-                arr[i] = ReadPathString(rec.PathStartIndex + i);
-
+            Array.Copy(_paths, rec.PathStartIndex, arr, 0, rec.PathCount);
             paths = arr;
             return true;
         }
 
         public HashStorageBuilder RestoreToBuilder(int initialCapacity = 0)
         {
-            var builder = new HashStorageBuilder(initialCapacity > 0 ? initialCapacity : _header.EntryCount);
+            var builder = new HashStorageBuilder(initialCapacity > 0 ? initialCapacity : _entries.Length);
 
-            for (int entryId = 0; entryId < _entryIndex.Length; entryId++)
+            Span<byte> hashBytes = stackalloc byte[Hash256.Size];
+
+            for (int entryId = 0; entryId < _entries.Length; entryId++)
             {
-                ref readonly EntryIndexRecord rec = ref _entryIndex[entryId];
-                int pathStart = rec.PathStartIndex;
-                int pathCount = rec.PathCount;
+                ref readonly EntryRecord entry = ref _entries[entryId];
+                entry.Hash.CopyTo(hashBytes);
 
-                Span<byte> hashBytes = new byte[Hash256.Size];
-                rec.Hash.CopyTo(hashBytes);
-
-                if (rec.Hash == Hash256.DirectoryMarker)
+                if (entry.Hash == Hash256.DirectoryMarker)
                 {
-                    for (int i = 0; i < pathCount; i++)
+                    for (int i = 0; i < entry.PathCount; i++)
                     {
-                        string path = ReadPathString(pathStart + i);
-                        builder.AddDir(path.AsSpan());
+                        builder.AddDir(_paths[entry.PathStartIndex + i].AsSpan());
                     }
                 }
                 else
                 {
-                    for (int i = 0; i < pathCount; i++)
+                    for (int i = 0; i < entry.PathCount; i++)
                     {
-                        string path = ReadPathString(pathStart + i);
-                        builder.AddFile(hashBytes, path.AsSpan(), rec.Size);
+                        builder.AddFile(hashBytes, _paths[entry.PathStartIndex + i].AsSpan(), entry.Size);
                     }
                 }
             }
@@ -433,53 +226,264 @@ namespace NTFSHardLinkDedup.Src
             return builder;
         }
 
+        private SearchResult FindAll()
+        {
+            var items = new List<HashPathPair>(Math.Min(MaxResult, 256));
+            bool exceeded = false;
+            int matchedCount = 0;
+
+            for (int pathId = 0; pathId < _paths.Length; pathId++)
+            {
+                matchedCount++;
+
+                if (items.Count >= MaxResult)
+                {
+                    exceeded = true;
+                    break;
+                }
+
+                ref readonly EntryRecord entry = ref _entries[_pathEntryIds[pathId]];
+                items.Add(new HashPathPair(entry.Hash, _paths[pathId], entry.Size));
+            }
+
+            return new SearchResult(items, exceeded, matchedCount);
+        }
+
         private List<HashPathPair> ExpandEntryToPairs(int entryId)
         {
-            ref readonly EntryIndexRecord rec = ref _entryIndex[entryId];
-            var list = new List<HashPathPair>(rec.PathCount);
+            ref readonly EntryRecord entry = ref _entries[entryId];
+            var list = new List<HashPathPair>(entry.PathCount);
 
-            for (int i = 0; i < rec.PathCount; i++)
+            for (int i = 0; i < entry.PathCount; i++)
             {
-                string path = ReadPathString(rec.PathStartIndex + i);
-                list.Add(new HashPathPair(rec.Hash, path, rec.Size));
+                string path = _paths[entry.PathStartIndex + i];
+                list.Add(new HashPathPair(entry.Hash, path, entry.Size));
             }
 
             return list;
         }
 
-        private string ReadPathString(int pathId)
+        private static HashListSearcher Parse(string sourcePath, byte[] fileBytes)
         {
-            ref readonly PathIndexRecord rec = ref _pathIndex[pathId];
-            EnsureBufferCapacity(rec.PathByteLength);
-            _pathBlobAccessor.ReadArray(rec.PathBlobOffset, _buffer, 0, rec.PathByteLength);
-            return Utf8.GetString(_buffer, 0, rec.PathByteLength);
-        }
+            ReadOnlySpan<byte> span = fileBytes;
 
-        private int FindExactPathId(ReadOnlySpan<byte> target)
-        {
-            for (int i = 0; i < _pathIndex.Length; i++)
+            if (span.Length < 16)
+                throw new InvalidDataException("File too small.");
+
+            if (!span.Slice(0, 8).SequenceEqual(FormatConstants.Magic))
+                throw new InvalidDataException("Invalid magic.");
+
+            long dataLength = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(8, 8));
+            if (dataLength < 0 || fileBytes.Length < 16 + dataLength)
+                throw new InvalidDataException("Invalid dataLength.");
+
+            ReadOnlySpan<byte> payload = span.Slice(16, (int)dataLength);
+
+            int? version = null;
+            int hashCount = 0;
+            int fileCount = 0;
+
+            var entries = new List<EntryRecord>(1024);
+            var paths = new List<string>(4096);
+            var pathEntryIds = new List<int>(4096);
+
+            int pos = 0;
+            while (pos < payload.Length)
             {
-                ref readonly PathIndexRecord rec = ref _pathIndex[i];
-                if (rec.PathByteLength != target.Length)
-                    continue;
+                if (payload.Length - pos < 12)
+                    throw new InvalidDataException("Broken top-level chunk.");
 
-                EnsureBufferCapacity(rec.PathByteLength);
-                _pathBlobAccessor.ReadArray(rec.PathBlobOffset, _buffer, 0, rec.PathByteLength);
+                ReadOnlySpan<byte> chunkId = payload.Slice(pos, 4);
+                long chunkLen = BinaryPrimitives.ReadInt64LittleEndian(payload.Slice(pos + 4, 8));
+                pos += 12;
 
-                if (_buffer.AsSpan(0, rec.PathByteLength).SequenceEqual(target))
-                    return i;
+                if (chunkLen < 0 || payload.Length - pos < chunkLen)
+                    throw new InvalidDataException("Broken chunk length.");
+
+                ReadOnlySpan<byte> chunkPayload = payload.Slice(pos, (int)chunkLen);
+
+                if (chunkId.SequenceEqual(ChunkIds.HVER))
+                {
+                    if (chunkPayload.Length != 4)
+                        throw new InvalidDataException("Invalid HVER chunk.");
+
+                    version = BinaryPrimitives.ReadInt32LittleEndian(chunkPayload);
+                }
+                else if (chunkId.SequenceEqual(ChunkIds.HCNT))
+                {
+                    if (chunkPayload.Length != 8)
+                        throw new InvalidDataException("Invalid HCNT chunk.");
+
+                    hashCount = BinaryPrimitives.ReadInt32LittleEndian(chunkPayload.Slice(0, 4));
+                    fileCount = BinaryPrimitives.ReadInt32LittleEndian(chunkPayload.Slice(4, 4));
+                }
+                else if (chunkId.SequenceEqual(ChunkIds.HREC))
+                {
+                    ParseHrec(chunkPayload, entries, paths, pathEntryIds);
+                }
+
+                pos += (int)chunkLen;
             }
 
-            return -1;
+            if (version != FormatConstants.Version)
+                throw new InvalidDataException($"Unsupported HLF version: {version}");
+
+            var hashDict = new Dictionary<Hash256, int>(entries.Count);
+            for (int i = 0; i < entries.Count; i++)
+                hashDict[entries[i].Hash] = i;
+
+            return new HashListSearcher(
+                sourcePath,
+                new HashListInfo(hashCount, fileCount),
+                [.. entries],
+                [.. paths],
+                [.. pathEntryIds],
+                hashDict.ToFrozenDictionary());
         }
 
-        private static List<List<byte[]>> ParseKeywordPattern(string pattern)
+        private static void ParseHrec(
+            ReadOnlySpan<byte> hrecPayload,
+            List<EntryRecord> entries,
+            List<string> paths,
+            List<int> pathEntryIds)
         {
-            var result = new List<List<byte[]>>();
+            int pos = 0;
+
+            while (pos < hrecPayload.Length)
+            {
+                if (hrecPayload.Length - pos < 12)
+                    throw new InvalidDataException("Broken HASH chunk.");
+
+                ReadOnlySpan<byte> chunkId = hrecPayload.Slice(pos, 4);
+                long chunkLen = BinaryPrimitives.ReadInt64LittleEndian(hrecPayload.Slice(pos + 4, 8));
+                pos += 12;
+
+                if (!chunkId.SequenceEqual(ChunkIds.HASH))
+                    throw new InvalidDataException("Non-HASH chunk found inside HREC.");
+
+                if (chunkLen < Hash256.Size + 8 || hrecPayload.Length - pos < chunkLen)
+                    throw new InvalidDataException("Broken HASH payload.");
+
+                ReadOnlySpan<byte> payload = hrecPayload.Slice(pos, (int)chunkLen);
+
+                var hash = new Hash256(payload.Slice(0, Hash256.Size));
+                ulong size = BinaryPrimitives.ReadUInt64LittleEndian(payload.Slice(Hash256.Size, 8));
+
+                int pathStartIndex = paths.Count;
+                int pathCount = 0;
+
+                int inner = Hash256.Size + 8;
+                while (inner < payload.Length)
+                {
+                    if (payload.Length - inner < 2)
+                        throw new InvalidDataException("Broken path LV.");
+
+                    ushort pathLen = BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(inner, 2));
+                    inner += 2;
+
+                    if (payload.Length - inner < pathLen)
+                        throw new InvalidDataException("Broken path payload.");
+
+                    string path = Utf8.GetString(payload.Slice(inner, pathLen));
+                    paths.Add(path);
+                    pathEntryIds.Add(entries.Count);
+
+                    inner += pathLen;
+                    pathCount++;
+                }
+
+                entries.Add(new EntryRecord(hash, size, pathStartIndex, pathCount));
+                pos += (int)chunkLen;
+            }
+        }
+
+        private static bool ValidateChunks(byte[] payload)
+        {
+            ReadOnlySpan<byte> span = payload;
+
+            int? version = null;
+            bool hasHrec = false;
+
+            int pos = 0;
+            while (pos < span.Length)
+            {
+                if (span.Length - pos < 12)
+                    return false;
+
+                ReadOnlySpan<byte> chunkId = span.Slice(pos, 4);
+                long chunkLen = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(pos + 4, 8));
+                pos += 12;
+
+                if (chunkLen < 0 || span.Length - pos < chunkLen)
+                    return false;
+
+                ReadOnlySpan<byte> chunkPayload = span.Slice(pos, (int)chunkLen);
+
+                if (chunkId.SequenceEqual(ChunkIds.HVER))
+                {
+                    if (chunkPayload.Length != 4)
+                        return false;
+
+                    version = BinaryPrimitives.ReadInt32LittleEndian(chunkPayload);
+                }
+                else if (chunkId.SequenceEqual(ChunkIds.HCNT))
+                {
+                    if (chunkPayload.Length != 8)
+                        return false;
+                }
+                else if (chunkId.SequenceEqual(ChunkIds.HREC))
+                {
+                    hasHrec = true;
+
+                    int inner = 0;
+                    while (inner < chunkPayload.Length)
+                    {
+                        if (chunkPayload.Length - inner < 12)
+                            return false;
+
+                        ReadOnlySpan<byte> hashId = chunkPayload.Slice(inner, 4);
+                        long hashLen = BinaryPrimitives.ReadInt64LittleEndian(chunkPayload.Slice(inner + 4, 8));
+                        inner += 12;
+
+                        if (!hashId.SequenceEqual(ChunkIds.HASH))
+                            return false;
+
+                        if (hashLen < Hash256.Size + 8 || chunkPayload.Length - inner < hashLen)
+                            return false;
+
+                        ReadOnlySpan<byte> hashPayload = chunkPayload.Slice(inner, (int)hashLen);
+                        int p = Hash256.Size + 8;
+                        while (p < hashPayload.Length)
+                        {
+                            if (hashPayload.Length - p < 2)
+                                return false;
+
+                            ushort pathLen = BinaryPrimitives.ReadUInt16LittleEndian(hashPayload.Slice(p, 2));
+                            p += 2;
+
+                            if (hashPayload.Length - p < pathLen)
+                                return false;
+
+                            p += pathLen;
+                        }
+
+                        inner += (int)hashLen;
+                    }
+                }
+
+                pos += (int)chunkLen;
+            }
+
+            return version == FormatConstants.Version && hasHrec;
+        }
+
+        private static List<List<string>> ParseKeywordPattern(string pattern)
+        {
+            var result = new List<List<string>>();
             if (string.IsNullOrWhiteSpace(pattern))
                 return result;
 
-            var currentGroup = new List<byte[]>();
+            var currentGroup = new List<string>();
             int i = 0;
             int len = pattern.Length;
 
@@ -496,7 +500,7 @@ namespace NTFSHardLinkDedup.Src
                     if (currentGroup.Count > 0)
                     {
                         result.Add(currentGroup);
-                        currentGroup = new List<byte[]>();
+                        currentGroup = new List<string>();
                     }
 
                     i++;
@@ -529,11 +533,7 @@ namespace NTFSHardLinkDedup.Src
                 }
 
                 if (!string.IsNullOrEmpty(token))
-                {
-                    byte[] encoded = Utf8.GetBytes(token);
-                    if (encoded.Length > 0)
-                        currentGroup.Add(encoded);
-                }
+                    currentGroup.Add(token);
             }
 
             if (currentGroup.Count > 0)
@@ -545,16 +545,16 @@ namespace NTFSHardLinkDedup.Src
             return result;
         }
 
-        private static bool MatchesKeywordPattern(ReadOnlySpan<byte> pathBytes, List<List<byte[]>> groups)
+        private static bool MatchesKeywordPattern(string path, List<List<string>> groups)
         {
             for (int g = 0; g < groups.Count; g++)
             {
-                List<byte[]> andTerms = groups[g];
+                List<string> andTerms = groups[g];
                 bool andMatched = true;
 
                 for (int t = 0; t < andTerms.Count; t++)
                 {
-                    if (pathBytes.IndexOf(andTerms[t]) < 0)
+                    if (path.IndexOf(andTerms[t], StringComparison.Ordinal) < 0)
                     {
                         andMatched = false;
                         break;
@@ -566,120 +566,6 @@ namespace NTFSHardLinkDedup.Src
             }
 
             return false;
-        }
-
-        private static HashListHeader ReadHeader(Stream stream)
-        {
-            Span<byte> i32 = stackalloc byte[4];
-            Span<byte> i64 = stackalloc byte[8];
-
-            ReadExact(stream, i32);
-            int version = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-            ReadExact(stream, i32);
-            int flags = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-            ReadExact(stream, i32);
-            int entryCount = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-            ReadExact(stream, i32);
-            int pathCount = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-            ReadExact(stream, i64);
-            long entryIndexOffset = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-            ReadExact(stream, i64);
-            long entryIndexLength = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-            ReadExact(stream, i64);
-            long pathIndexOffset = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-            ReadExact(stream, i64);
-            long pathIndexLength = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-            ReadExact(stream, i64);
-            long pathBlobOffset = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-            ReadExact(stream, i64);
-            long pathBlobLength = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-            return new HashListHeader(
-                version,
-                flags,
-                entryCount,
-                pathCount,
-                entryIndexOffset,
-                entryIndexLength,
-                pathIndexOffset,
-                pathIndexLength,
-                pathBlobOffset,
-                pathBlobLength);
-        }
-
-        private static EntryIndexRecord[] ReadEntryIndex(Stream stream, long dataAreaStart, HashListHeader header)
-        {
-            var arr = new EntryIndexRecord[header.EntryCount];
-            stream.Position = dataAreaStart + header.EntryIndexOffset;
-
-            Span<byte> hashBuf = stackalloc byte[Hash256.Size];
-            Span<byte> i32 = stackalloc byte[4];
-            Span<byte> i64 = stackalloc byte[8];
-
-            for (int i = 0; i < arr.Length; i++)
-            {
-                ReadExact(stream, hashBuf);
-                ReadExact(stream, i64);
-                ulong size = BinaryPrimitives.ReadUInt64LittleEndian(i64);
-
-                ReadExact(stream, i32);
-                int pathStartIndex = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-                ReadExact(stream, i32);
-                int pathCount = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-                arr[i] = new EntryIndexRecord(new Hash256(hashBuf), size, pathStartIndex, pathCount);
-            }
-
-            return arr;
-        }
-
-        private static PathIndexRecord[] ReadPathIndex(Stream stream, long dataAreaStart, HashListHeader header)
-        {
-            var arr = new PathIndexRecord[header.PathCount];
-            stream.Position = dataAreaStart + header.PathIndexOffset;
-
-            Span<byte> i32 = stackalloc byte[4];
-            Span<byte> i64 = stackalloc byte[8];
-
-            for (int i = 0; i < arr.Length; i++)
-            {
-                ReadExact(stream, i64);
-                long pathBlobOffset = BinaryPrimitives.ReadInt64LittleEndian(i64);
-
-                ReadExact(stream, i32);
-                int pathByteLength = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-                ReadExact(stream, i32);
-                int entryId = BinaryPrimitives.ReadInt32LittleEndian(i32);
-
-                arr[i] = new PathIndexRecord(pathBlobOffset, pathByteLength, entryId);
-            }
-
-            return arr;
-        }
-
-        private void EnsureBufferCapacity(int len)
-        {
-            if (_buffer.Length >= len) return;
-            ArrayPool<byte>.Shared.Return(_buffer);
-            _buffer = ArrayPool<byte>.Shared.Rent(len);
-        }
-
-        private void EnsureKeywordCapacity(int len)
-        {
-            if (_keywordBuffer.Length >= len) return;
-            ArrayPool<byte>.Shared.Return(_keywordBuffer);
-            _keywordBuffer = ArrayPool<byte>.Shared.Rent(len);
         }
 
         private static void ReadExact(Stream stream, Span<byte> buffer)
@@ -694,13 +580,21 @@ namespace NTFSHardLinkDedup.Src
             }
         }
 
+        private static void ReadExact(Stream stream, byte[] buffer)
+        {
+            int total = 0;
+            while (total < buffer.Length)
+            {
+                int n = stream.Read(buffer, total, buffer.Length - total);
+                if (n <= 0)
+                    throw new EndOfStreamException();
+                total += n;
+            }
+        }
+
         public void Dispose()
         {
-            _pathBlobAccessor.Dispose();
-            _mmf.Dispose();
-            _stream.Dispose();
-            ArrayPool<byte>.Shared.Return(_buffer);
-            ArrayPool<byte>.Shared.Return(_keywordBuffer);
+            // 仅托管内存，无需释放外部资源
         }
     }
 }

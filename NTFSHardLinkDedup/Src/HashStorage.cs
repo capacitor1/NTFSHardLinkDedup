@@ -23,71 +23,30 @@ namespace NTFSHardLinkDedup.Src
             public readonly string Path = path;
         }
 
-        private sealed class EntryBucket(ulong size, int capacity)
+        private sealed class EntryBucket
         {
-            public ulong Size = size;
-            public readonly List<PathItem> Paths = new List<PathItem>(capacity);
+            public ulong Size;
+            public readonly List<PathItem> Paths;
+
+            public EntryBucket(ulong size, int capacity)
+            {
+                Size = size;
+                Paths = new List<PathItem>(capacity);
+            }
+        }
+
+        private static class ChunkIds
+        {
+            public static ReadOnlySpan<byte> HVER => "HVER"u8;
+            public static ReadOnlySpan<byte> HCNT => "HCNT"u8;
+            public static ReadOnlySpan<byte> HREC => "HREC"u8;
+            public static ReadOnlySpan<byte> HASH => "HASH"u8;
         }
 
         private static class FormatConstants
         {
             public static ReadOnlySpan<byte> Magic => "HashList"u8;
-
-            public const int Version = 3;
-
-            // HeaderFixed:
-            // int Version
-            // int Flags
-            // int EntryCount
-            // int PathCount
-            // long EntryIndexOffset
-            // long EntryIndexLength
-            // long PathIndexOffset
-            // long PathIndexLength
-            // long PathBlobOffset
-            // long PathBlobLength
-            public const int HeaderFixedSize =
-                4 + 4 + 4 + 4 +
-                8 + 8 +
-                8 + 8 +
-                8 + 8;
-
-            // EntryIndexRecord:
-            // 32 bytes Hash
-            // 8 bytes Size
-            // 4 bytes PathStartIndex
-            // 4 bytes PathCount
-            public const int EntryIndexRecordSize = 32 + 8 + 4 + 4;
-
-            // PathIndexRecord:
-            // 8 bytes PathBlobOffset
-            // 4 bytes PathByteLength
-            // 4 bytes EntryId
-            public const int PathIndexRecordSize = 8 + 4 + 4;
-        }
-
-        private readonly struct HashListHeader(
-            int version,
-            int flags,
-            int entryCount,
-            int pathCount,
-            long entryIndexOffset,
-            long entryIndexLength,
-            long pathIndexOffset,
-            long pathIndexLength,
-            long pathBlobOffset,
-            long pathBlobLength)
-        {
-            public readonly int Version = version;
-            public readonly int Flags = flags;
-            public readonly int EntryCount = entryCount;
-            public readonly int PathCount = pathCount;
-            public readonly long EntryIndexOffset = entryIndexOffset;
-            public readonly long EntryIndexLength = entryIndexLength;
-            public readonly long PathIndexOffset = pathIndexOffset;
-            public readonly long PathIndexLength = pathIndexLength;
-            public readonly long PathBlobOffset = pathBlobOffset;
-            public readonly long PathBlobLength = pathBlobLength;
+            public const int Version = 1;
         }
 
         public int EntryCount => _map.Count;
@@ -99,10 +58,6 @@ namespace NTFSHardLinkDedup.Src
 
             return _pathSet.Contains(path.ToString());
         }
-
-        public bool TryAddFile(ReadOnlyMemory<byte> hash, ReadOnlySpan<char> path, ulong size)
-            => TryAddFile(hash.Span, path, size);
-
         public bool TryAddFile(ReadOnlySpan<byte> hash, ReadOnlySpan<char> path, ulong size)
         {
             if (hash.Length != Hash256.Size)
@@ -124,7 +79,6 @@ namespace NTFSHardLinkDedup.Src
             }
             else
             {
-                // 同 hash 文件大小应相同；内部库下直接强约束
                 if (bucket.Size != size)
                     throw new InvalidDataException("Files with the same hash must have the same size.");
             }
@@ -190,54 +144,38 @@ namespace NTFSHardLinkDedup.Src
 
         public void WriteTo(Stream stream)
         {
-            ArgumentNullException.ThrowIfNull(stream);
+            if (stream is null) throw new ArgumentNullException(nameof(stream));
 
-            int entryCount = _map.Count;
-            int pathCount = 0;
-            long pathBlobRawLength = 0;
+            int hashCount = 0;
+            int fileCount = 0;
+
+            long hrecPayloadLength = 0;
 
             foreach (var kv in _map)
             {
-                var paths = kv.Value.Paths;
-                pathCount += paths.Count;
+                var bucket = kv.Value;
+                hashCount++;
 
-                for (int i = 0; i < paths.Count; i++)
+                fileCount += bucket.Paths.Count;
+
+                long hashPayloadLen = Hash256.Size + 8; // hash + size
+                for (int i = 0; i < bucket.Paths.Count; i++)
                 {
-                    int byteCount = Utf8.GetByteCount(paths[i].Path);
+                    int byteCount = Utf8.GetByteCount(bucket.Paths[i].Path);
                     if ((uint)byteCount > ushort.MaxValue)
                         throw new InvalidDataException("Path UTF-8 byte length exceeds ushort.MaxValue.");
 
-                    pathBlobRawLength += byteCount;
+                    hashPayloadLen += 2 + byteCount;
                 }
+
+                hrecPayloadLength += 4 + 8 + hashPayloadLen; // HASH + payloadLen + payload
             }
 
-            // 每条 path 后额外写一个 0 分隔字节，避免跨 path 误命中
-            long pathBlobLength = pathBlobRawLength + pathCount;
+            long hverChunkLen = 4 + 8 + 4;       // id + len + version(int32)
+            long hcntChunkLen = 4 + 8 + 8;       // id + len + hashCount(int32)+fileCount(int32)
+            long hrecChunkLen = 4 + 8 + hrecPayloadLength;
 
-            long entryIndexLength = (long)entryCount * FormatConstants.EntryIndexRecordSize;
-            long pathIndexLength = (long)pathCount * FormatConstants.PathIndexRecordSize;
-
-            long entryIndexOffset = FormatConstants.HeaderFixedSize;
-            long pathIndexOffset = entryIndexOffset + entryIndexLength;
-            long pathBlobOffset = pathIndexOffset + pathIndexLength;
-
-            long dataLength =
-                FormatConstants.HeaderFixedSize +
-                entryIndexLength +
-                pathIndexLength +
-                pathBlobLength;
-
-            var header = new HashListHeader(
-                version: FormatConstants.Version,
-                flags: 0,
-                entryCount: entryCount,
-                pathCount: pathCount,
-                entryIndexOffset: entryIndexOffset,
-                entryIndexLength: entryIndexLength,
-                pathIndexOffset: pathIndexOffset,
-                pathIndexLength: pathIndexLength,
-                pathBlobOffset: pathBlobOffset,
-                pathBlobLength: pathBlobLength);
+            long dataLength = hverChunkLen + hcntChunkLen + hrecChunkLen;
 
             Span<byte> i32 = stackalloc byte[4];
             Span<byte> i64 = stackalloc byte[8];
@@ -247,69 +185,44 @@ namespace NTFSHardLinkDedup.Src
             BinaryPrimitives.WriteInt64LittleEndian(i64, dataLength);
             stream.Write(i64);
 
-            WriteHeader(stream, header);
+            // HVER
+            WriteChunkHeader(stream, ChunkIds.HVER, 4);
+            BinaryPrimitives.WriteInt32LittleEndian(i32, FormatConstants.Version);
+            stream.Write(i32);
+
+            // HCNT
+            WriteChunkHeader(stream, ChunkIds.HCNT, 8);
+            BinaryPrimitives.WriteInt32LittleEndian(i32, hashCount);
+            stream.Write(i32);
+            BinaryPrimitives.WriteInt32LittleEndian(i32, fileCount);
+            stream.Write(i32);
+
+            // HREC
+            WriteChunkHeader(stream, ChunkIds.HREC, hrecPayloadLength);
 
             byte[] rented = ArrayPool<byte>.Shared.Rent(4096);
 
             try
             {
-                // EntryIndex
-                int entryId = 0;
-                int globalPathIndex = 0;
-
                 foreach (var kv in _map)
                 {
                     Hash256 hash = kv.Key;
                     EntryBucket bucket = kv.Value;
+
+                    long hashPayloadLen = Hash256.Size + 8;
+                    for (int i = 0; i < bucket.Paths.Count; i++)
+                    {
+                        int byteCount = Utf8.GetByteCount(bucket.Paths[i].Path);
+                        hashPayloadLen += 2 + byteCount;
+                    }
+
+                    WriteChunkHeader(stream, ChunkIds.HASH, hashPayloadLen);
 
                     hash.CopyTo(hashBuf);
                     stream.Write(hashBuf);
 
                     BinaryPrimitives.WriteUInt64LittleEndian(i64, bucket.Size);
                     stream.Write(i64);
-
-                    BinaryPrimitives.WriteInt32LittleEndian(i32, globalPathIndex);
-                    stream.Write(i32);
-
-                    BinaryPrimitives.WriteInt32LittleEndian(i32, bucket.Paths.Count);
-                    stream.Write(i32);
-
-                    globalPathIndex += bucket.Paths.Count;
-                    entryId++;
-                }
-
-                // PathIndex
-                entryId = 0;
-                long currentBlobOffset = 0;
-
-                foreach (var kv in _map)
-                {
-                    EntryBucket bucket = kv.Value;
-
-                    for (int i = 0; i < bucket.Paths.Count; i++)
-                    {
-                        string path = bucket.Paths[i].Path;
-                        int byteCount = Utf8.GetByteCount(path);
-
-                        BinaryPrimitives.WriteInt64LittleEndian(i64, currentBlobOffset);
-                        stream.Write(i64);
-
-                        BinaryPrimitives.WriteInt32LittleEndian(i32, byteCount);
-                        stream.Write(i32);
-
-                        BinaryPrimitives.WriteInt32LittleEndian(i32, entryId);
-                        stream.Write(i32);
-
-                        currentBlobOffset += byteCount + 1;
-                    }
-
-                    entryId++;
-                }
-
-                // PathBlob
-                foreach (var kv in _map)
-                {
-                    EntryBucket bucket = kv.Value;
 
                     for (int i = 0; i < bucket.Paths.Count; i++)
                     {
@@ -323,8 +236,10 @@ namespace NTFSHardLinkDedup.Src
                         }
 
                         int written = Utf8.GetBytes(path.AsSpan(), rented);
+
+                        BinaryPrimitives.WriteUInt16LittleEndian(i32[..2], (ushort)written);
+                        stream.Write(i32[..2]);
                         stream.Write(rented.AsSpan(0, written));
-                        stream.WriteByte(0);
                     }
                 }
             }
@@ -334,54 +249,27 @@ namespace NTFSHardLinkDedup.Src
             }
         }
 
-        public static HashStorageBuilder RestoreFromFile(string filePath, int fileBufferSize = 1 << 20, int initialCapacity = 0)
+        public static HashStorageBuilder RestoreFromFile(string filePath, int initialCapacity = 0)
         {
             if (!HashListSearcher.IsValidFile(filePath))
                 throw new InvalidDataException("Invalid hashlist file.");
 
-            using var searcher = new HashListSearcher(filePath, fileBufferSize);
-            return searcher.RestoreToBuilder(initialCapacity);
+            var searcher = HashListSearcher.OpenAsync(filePath).GetAwaiter().GetResult();
+            using (searcher)
+            {
+                return searcher.RestoreToBuilder(initialCapacity);
+            }
         }
 
-        private static void WriteHeader(Stream stream, HashListHeader h)
+        private static void WriteChunkHeader(Stream stream, ReadOnlySpan<byte> chunkId, long payloadLength)
         {
-            Span<byte> i32 = stackalloc byte[4];
+            if (chunkId.Length != 4)
+                throw new ArgumentException("Chunk id must be 4 bytes.", nameof(chunkId));
+
             Span<byte> i64 = stackalloc byte[8];
-
-            BinaryPrimitives.WriteInt32LittleEndian(i32, h.Version);
-            stream.Write(i32);
-
-            BinaryPrimitives.WriteInt32LittleEndian(i32, h.Flags);
-            stream.Write(i32);
-
-            BinaryPrimitives.WriteInt32LittleEndian(i32, h.EntryCount);
-            stream.Write(i32);
-
-            BinaryPrimitives.WriteInt32LittleEndian(i32, h.PathCount);
-            stream.Write(i32);
-
-            BinaryPrimitives.WriteInt64LittleEndian(i64, h.EntryIndexOffset);
+            stream.Write(chunkId);
+            BinaryPrimitives.WriteInt64LittleEndian(i64, payloadLength);
             stream.Write(i64);
-
-            BinaryPrimitives.WriteInt64LittleEndian(i64, h.EntryIndexLength);
-            stream.Write(i64);
-
-            BinaryPrimitives.WriteInt64LittleEndian(i64, h.PathIndexOffset);
-            stream.Write(i64);
-
-            BinaryPrimitives.WriteInt64LittleEndian(i64, h.PathIndexLength);
-            stream.Write(i64);
-
-            BinaryPrimitives.WriteInt64LittleEndian(i64, h.PathBlobOffset);
-            stream.Write(i64);
-
-            BinaryPrimitives.WriteInt64LittleEndian(i64, h.PathBlobLength);
-            stream.Write(i64);
-        }
-        public void Clear()
-        {
-            _map.Clear();
-            _pathSet.Clear();
         }
     }
 }
