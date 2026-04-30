@@ -1,5 +1,7 @@
 using NTFSHardLinkDedup.Src;
 using System.Collections.Frozen;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Security.Policy;
 
@@ -162,6 +164,7 @@ namespace NTFSHardLinkDedup
                 }
             }
         }
+        #region VirtualList+HashRow+ResultList
         private List<HashRow> _rows = new List<HashRow>();
         private int _sortColumn = -1;
         private bool _sortAscending = true;
@@ -191,7 +194,7 @@ namespace NTFSHardLinkDedup
 
             var item = new ListViewItem(row.Hash);
             item.SubItems.Add(row.FilePath);
-            item.SubItems.Add(row.SizeDisplay);
+            item.SubItems.Add(row.GetSizeDisplay(UI_ViewKBOnly.Checked, UI_IsIEC.Checked));
 
             e.Item = item;
         }
@@ -251,18 +254,10 @@ namespace NTFSHardLinkDedup
             public ulong SizeBytes { get; set; }
 
             // UI显示值，用于第三列显示
-            public string SizeDisplay => FormatSizeKb(SizeBytes);
+            public string GetSizeDisplay(bool isKB, bool isIEC) => isKB ? Util.FormatBytesKB(SizeBytes) : Util.FormatBytes(SizeBytes, isIEC);
 
-            private static string FormatSizeKb(ulong bytes)
-            {
-                if (bytes == 0)
-                    return "0 KB";
-
-                ulong kb = (bytes + 1023) / 1024; // 向上取整
-                return $"{kb:N0} KB";
-            }
         }
-
+        #endregion
         private bool IsRunning = false;
 
         private bool IsGlobalStop = false;
@@ -284,18 +279,23 @@ namespace NTFSHardLinkDedup
         private async void M_T_Run_Click(object sender, EventArgs e)
         {
             string M_Path = M_P_RootPath.Text;
-            if ((!Directory.Exists(M_Path) && !M_Path.EndsWith(":\\$MFT")) || M_Path == string.Empty)
+            if ((!Directory.Exists(M_Path) && !M_Path.EndsWith(":\\$MFT", StringComparison.OrdinalIgnoreCase)) || M_Path == string.Empty)
             {
-                //invalid parameters
-                MessageBox.Show("Invalid parameters, please check again.", "Warn", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                //invalid path
+                MessageBox.Show("Invalid root path, please check again.", "Warn", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
             if (File.Exists(M_P_SavePath.Text))
             {
-                DialogResult dr = MessageBox.Show("Save file already exists. Append it?\r\nYes = Append, No = Overwrite", "Info", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                DialogResult dr = MessageBox.Show("Save file already exists. Append?\r\nYes = Append, No = Overwrite", "Info", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (dr == DialogResult.No)
                 {
                     File.Delete(M_P_SavePath.Text);
+                }
+                else if(dr == DialogResult.Cancel)
+                {
+                    Log($"Task canceled because HLF file exists.");
+                    return;
                 }
             }
 
@@ -326,10 +326,13 @@ namespace NTFSHardLinkDedup
 
                 #region 扫描文件
                 M_S_Stage.Text = "Scanning disk...";
-                Object list;//result list
+                bool ismftmthd = false;
+                //default
+                DiskScanList R_norm = new();
+                ScanResult R_mft = new([],new());
 
                 DiskScan ds = new(M_Path);
-                if (M_Path.EndsWith(":\\$MFT"))
+                if (M_Path.EndsWith(":\\$MFT",StringComparison.OrdinalIgnoreCase))
                 {
                     //check admin
                     if (!Util.IsRunAsAdministrator())
@@ -344,16 +347,17 @@ namespace NTFSHardLinkDedup
                             return;
                         }
                     }
+                    ismftmthd = true;
                     Log("Using scan mode = MFT");
                     //mftscan
                     char drvletter = M_Path[0];
                     M_Path = $"{drvletter}:\\";
                     MFTScan mftscan = new(drvletter);
                     mftscan.StatsUpdated += OnStats;
-                    list = await mftscan.Scan(() => IsGlobalStop);//type = ScanResult
+                    R_mft = await mftscan.Scan(() => IsGlobalStop);
                     mftscan.StatsUpdated -= OnStats;
                     await Task.Delay(1000);
-                    ScanStats stats = ((ScanResult)list).Stats;
+                    ScanStats stats = R_mft.Stats;
                     //test
                     //await File.WriteAllLinesAsync(M_P_SavePath.Text,((ScanResult)list).Entries.Select(e => e.Path),new UTF8Encoding(false));
                     //
@@ -365,6 +369,7 @@ namespace NTFSHardLinkDedup
                 }
                 else
                 {
+                    ismftmthd = false;
                     Log("Using scan mode = Normal");
                     ds.Scan();
                     // UI刷新循环
@@ -385,23 +390,21 @@ namespace NTFSHardLinkDedup
                     await ds.Completion;
 
                     // 这里说明扫描自然完成
-                    //DiskScanList list = ds.GetList();
-                    list = ds.GetList();//type = DiskScanList
+                    R_norm = ds.GetList();
                 }
                 #endregion
-                bool isnormalscan = list is DiskScanList;//T=normal F=MFT
+
                 #region 计算SHA256并存储
                 M_S_Stage.Text = "Calculating SHA-256...";
                 ioc.Start();
                 long calced = 0, total, error = 0, exists = 0;
-                if (isnormalscan)
+                if (ismftmthd)
                 {
-                    ref readonly DiskScanList scanList = ref Unsafe.Unbox<DiskScanList>(list);
-                    total = scanList.Count;
+                    total = R_mft.Entries.Count;
                 }
                 else
                 {
-                    total = ((ScanResult)list).Entries.Count;
+                    total = R_norm.Count;
                 }
                 bool finished = false;
                 HashStorageBuilder hashStorageBuilder = HashListSearcher.IsValidFile(M_P_SavePath.Text) ? HashStorageBuilder.RestoreFromFile(M_P_SavePath.Text) : new HashStorageBuilder(capacity: (int)total / 2);
@@ -420,100 +423,92 @@ namespace NTFSHardLinkDedup
                     ioc.Dispose();
                 });
                 HashSet<string> skippedinsha256 = new HashSet<string>();
-                if (isnormalscan)
+                if (!ismftmthd)
                 {
-                    ref readonly DiskScanList scanList = ref Unsafe.Unbox<DiskScanList>(list);
-                    foreach (var entry in scanList)
+                    foreach (var entry in R_norm)
                     {
                         if (hashStorageBuilder.ContainsPath(entry.Path))
                         {
                             //exists
                             skippedinsha256.Add(entry.PathString);
-                            Interlocked.Increment(ref exists);
+                            exists++;
                             continue;
                         }
                         if (!entry.IsDirectory)
                         {
                             //file
-                            SHA256Calc calc = new SHA256Calc(M_Path, entry.Path, () => IsGlobalStop);
+                            SHA256Calc? calc = null;
                             try
                             {
-                                ReadOnlyMemory<byte> hash = await calc.CalcSha256();
-                                //store
-                                hashStorageBuilder.AddFile(hash, entry.Path, calc.GetFileLen());
+                                calc = new SHA256Calc(M_Path, entry.Path, () => IsGlobalStop);
+                                hashStorageBuilder.AddFile(await calc.CalcSha256(), entry.Path, calc.GetFileLen());
                             }
                             catch (TaskCanceledException)
                             {
+                                finished = true;
                                 throw;//by user
                             }
                             catch (Exception ex)
                             {
                                 Log($"SHA256 Error: {ex.GetType()} '{ex.Message}'");
-                                Interlocked.Increment(ref error);
-                                calc.Dispose();
-                                continue;
+                                error++;
                             }
                             finally
                             {
-                                calc.Dispose();
+                                calc?.Dispose();
                             }
                         }
                         else
                         {
                             //dir
-                            //store
                             hashStorageBuilder.AddDir(entry.Path);
                         }
-                        Interlocked.Increment(ref calced);
+                        calced++;
                     }
                 }
                 else
                 {
-                    foreach (var entry in ((ScanResult)list).Entries)
+                    foreach (var entry in R_mft.Entries)
                     {
                         if (hashStorageBuilder.ContainsPath(entry.Path))
                         {
                             //exists
                             skippedinsha256.Add(entry.Path);
-                            Interlocked.Increment(ref exists);
+                            exists++;
                             continue;
                         }
                         if (!entry.IsDir)
                         {
                             //file
-                            SHA256Calc calc = new SHA256Calc(M_Path, entry.Path, () => IsGlobalStop);
+                            SHA256Calc? calc = null;
                             try
                             {
-                                ReadOnlyMemory<byte> hash = await calc.CalcSha256();
-                                //store
-                                hashStorageBuilder.AddFile(hash, entry.Path, calc.GetFileLen());
+                                calc = new SHA256Calc(M_Path, entry.Path, () => IsGlobalStop);
+                                hashStorageBuilder.AddFile(await calc.CalcSha256(), entry.Path, calc.GetFileLen());
                             }
                             catch (TaskCanceledException)
                             {
+                                finished = true;
                                 throw;//by user
                             }
                             catch (Exception ex)
                             {
                                 Log($"SHA256 Error: {ex.GetType()} '{ex.Message}'");
-                                Interlocked.Increment(ref error);
-                                calc.Dispose();
-                                continue;
+                                error++;
                             }
                             finally
                             {
-                                calc.Dispose();
+                                calc?.Dispose();
                             }
                         }
                         else
                         {
                             //dir
-                            //store
                             hashStorageBuilder.AddDir(entry.Path);
                         }
-                        Interlocked.Increment(ref calced);
+                        calced++;
                     }
                 }
-
                 finished = true;
 
                 //完成计算，清理DiskScan
@@ -560,7 +555,6 @@ namespace NTFSHardLinkDedup
             catch (TaskCanceledException)
             {
                 ioc.Dispose();
-                //MessageBox.Show("Task stopped by user.", "Info", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 Log("Task stopped by user.");
             }
             catch (Exception ex)
@@ -622,10 +616,15 @@ namespace NTFSHardLinkDedup
             }
         }
 
-
-        // search
+        #region HashListSearch
         private HashListSearcher? searcher;
         private string HLFPath = string.Empty;
+
+        //状态缓存
+        private int _TmpResultCount = 0;
+        private ulong _TmpTotalSize = 0;
+        private bool _TmpExceedLim = false,_TmpHasResult = false;
+
         private void V_S_Search_Click(object sender, EventArgs e)
         {
             var u = Task.Run(async () =>
@@ -650,33 +649,9 @@ namespace NTFSHardLinkDedup
             V_S.Enabled = V_S_HLFPath.Enabled = V_S_Result.Enabled = false;
             if (searcher == null)
             {
-                //init
-                HLFPath = V_S_HLFPath.Text;
-                if (!HashListSearcher.IsValidFile(HLFPath))
-                {
-                    MessageBox.Show("Invalid HashList file, please check again.", "Warn", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    V_S.Enabled = true;
-                    return;
-                }
-
-
-                ShowTabLoading(Page_View);
-                searcher = await HashListSearcher.OpenAsync(HLFPath);
-                HideTabLoading();
-            }
-            else
-            {
-                if (HLFPath != V_S_HLFPath.Text)
-                {
-                    HLFPath = V_S_HLFPath.Text;
-                    //re-init
-                    searcher.Dispose();
-
-
-                    ShowTabLoading(Page_View);
-                    searcher = await HashListSearcher.OpenAsync(HLFPath);
-                    HideTabLoading();
-                }
+                MessageBox.Show("No loaded HashList file, please check.", "Warn", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                V_S.Enabled = V_S_HLFPath.Enabled = V_S_Result.Enabled = true;
+                return;
             }
             searcher.MaxResult = (int)V_S_Max.Value;
             //search
@@ -708,11 +683,12 @@ namespace NTFSHardLinkDedup
                             total += item.Size;
                         }
                         _rows = data;
-                        V_ResultsC.Text = $"Result: {byHash!.Count:N0} results! ({total:N0} B, {Util.FormatBytes(total)})";
+
+                        SaveSResultsInfo(true, false, total, byHash!.Count);
                     }
                     else
                     {
-                        V_ResultsC.Text = $"Result: No results!";
+                        SaveSResultsInfo(false, false,0, 0);
                     }
                 }
                 else
@@ -740,58 +716,33 @@ namespace NTFSHardLinkDedup
                     total += item.Size;
                 }
                 _rows = data;
-                V_ResultsC.Text = sr.ExceededMaxResults
-                    ? $"Result: {sr.Items.Count:N0} (Hit: {sr.ScannedHitCount:N0}) ({total:N0} B, {Util.FormatBytes(total)}) (Warn:Max results exceeded.)"
-                    : $"Result: {sr.Items.Count:N0} (Hit: {sr.ScannedHitCount:N0}) ({total:N0} B, {Util.FormatBytes(total)})";
+
+                SaveSResultsInfo(true, sr.ExceededMaxResults, total, sr.Items.Count);
             }
             V_S_Result.VirtualListSize = _rows.Count;
             V_S_Result.Invalidate();
+            ShowSResultsInfo();
             V_S.Enabled = V_S_HLFPath.Enabled = V_S_Result.Enabled = true;
             HideTabLoading();
         }
-
-        private void button1_Click(object sender, EventArgs e)
+        private void SaveSResultsInfo(bool hasresult,bool exceedlim,ulong size,int count)
         {
-            using (var dialog = new OpenFileDialog())
+            lock (_lock)
             {
-                dialog.Filter = "HashList Format (*.hlf)|*.hlf|All (*.*)|*.*";
-                dialog.DefaultExt = "hlf";
-                dialog.AddExtension = true;
-                dialog.CheckFileExists = true;
-                dialog.CheckPathExists = true;
-                dialog.Multiselect = false;
-                dialog.ValidateNames = true;
-
-                if (dialog.ShowDialog(this) == DialogResult.OK)
-                {
-                    V_S_HLFPath.Text = dialog.FileName;
-                }
+                _TmpHasResult = hasresult;
+                _TmpExceedLim = exceedlim;
+                _TmpTotalSize = size;
+                _TmpResultCount = count;
             }
         }
+        private void ShowSResultsInfo() => V_ResultsC.Text = _TmpExceedLim
+                    ? $"Results: {_TmpResultCount:N0} ({_TmpTotalSize:N0} B, {Util.FormatBytes(_TmpTotalSize, UI_IsIEC.Checked)}) (Warn:Max results exceeded.)"
+                    : $"Results: {_TmpResultCount:N0} ({_TmpTotalSize:N0} B, {Util.FormatBytes(_TmpTotalSize, UI_IsIEC.Checked)})";
+
 
         private void V_S_Max_ValueChanged(object sender, EventArgs e)
         {
             searcher?.MaxResult = (int)V_S_Max.Value;
-        }
-
-        private void openHashListToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            button1_Click(sender, e);
-
-            TabCtrl.SelectedIndex = 1;
-        }
-
-        private void runAsAdministratorToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            Util.RestartAsAdministrator();
-        }
-
-        private void M_S_LogClear_Click(object sender, EventArgs e)
-        {
-            lock (_lock)
-            {
-                M_S_Log.Clear();
-            }
         }
 
         private async void V_S_HLFPath_TextChanged(object sender, EventArgs e)
@@ -805,10 +756,10 @@ namespace NTFSHardLinkDedup
                 HLFPath = V_S_HLFPath.Text;
                 if (!HashListSearcher.IsValidFile(HLFPath))
                 {
-                    Log("Invalid HashList file, please check again.");
+                    MessageBox.Show("Invalid HashList file, please check again.", "Warn", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    V_S.Enabled = V_S_HLFPath.Enabled = V_S_Result.Enabled = true;
                     return;
                 }
-
 
                 ShowTabLoading(Page_View);
                 searcher = await HashListSearcher.OpenAsync(HLFPath);
@@ -821,12 +772,12 @@ namespace NTFSHardLinkDedup
                     HLFPath = V_S_HLFPath.Text;
                     if (!HashListSearcher.IsValidFile(HLFPath))
                     {
-                        Log("Invalid HashList file, please check again.");
+                        MessageBox.Show("Invalid HashList file, please check again.", "Warn", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        V_S.Enabled = V_S_HLFPath.Enabled = V_S_Result.Enabled = true;
                         return;
                     }
                     //re-init
                     searcher.Dispose();
-
 
                     ShowTabLoading(Page_View);
                     searcher = await HashListSearcher.OpenAsync(HLFPath);
@@ -846,7 +797,7 @@ namespace NTFSHardLinkDedup
             int i = V_S_Result.SelectedIndices[0];
             try
             {
-                Clipboard.SetText($"{_rows[i].Hash}\t{_rows[i].FilePath}\t{_rows[i].SizeDisplay}");
+                Clipboard.SetText($"{_rows[i].Hash}\t{_rows[i].FilePath}\t{_rows[i].GetSizeDisplay(UI_ViewKBOnly.Checked, UI_IsIEC.Checked)}");
             }
             catch (Exception ex)
             {
@@ -891,7 +842,7 @@ namespace NTFSHardLinkDedup
             int i = V_S_Result.SelectedIndices[0];
             try
             {
-                Clipboard.SetText(_rows[i].SizeDisplay);
+                Clipboard.SetText(_rows[i].GetSizeDisplay(UI_ViewKBOnly.Checked, UI_IsIEC.Checked));
             }
             catch (Exception ex)
             {
@@ -911,6 +862,59 @@ namespace NTFSHardLinkDedup
             catch (Exception ex)
             {
                 Log($"Clipboard error : {ex.Message}");
+            }
+        }
+        private void UI_IsIEC_Click(object sender, EventArgs e)
+        {
+            V_S_Result.Invalidate();
+            ShowSResultsInfo();
+        }
+
+        private void UI_ViewKBOnly_Click(object sender, EventArgs e)
+        {
+            V_S_Result.Invalidate();
+            ShowSResultsInfo();
+        }
+
+        #endregion
+
+        private void button1_Click(object sender, EventArgs e)
+        {
+            using (var dialog = new OpenFileDialog())
+            {
+                dialog.Filter = "HashList Format (*.hlf)|*.hlf|All (*.*)|*.*";
+                dialog.DefaultExt = "hlf";
+                dialog.AddExtension = true;
+                dialog.CheckFileExists = true;
+                dialog.CheckPathExists = true;
+                dialog.Multiselect = false;
+                dialog.ValidateNames = true;
+
+                if (dialog.ShowDialog(this) == DialogResult.OK)
+                {
+                    V_S_HLFPath.Text = dialog.FileName;
+                }
+            }
+        }
+
+
+        private void openHashListToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            button1_Click(sender, e);
+
+            TabCtrl.SelectedIndex = 1;
+        }
+
+        private void runAsAdministratorToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            Util.RestartAsAdministrator();
+        }
+
+        private void M_S_LogClear_Click(object sender, EventArgs e)
+        {
+            lock (_lock)
+            {
+                M_S_Log.Clear();
             }
         }
 

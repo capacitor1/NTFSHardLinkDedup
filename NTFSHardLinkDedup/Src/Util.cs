@@ -69,15 +69,24 @@ namespace NTFSHardLinkDedup.Src
             double mbps = bytesPerSecond / 1024d / 1024d;
             return $"{mbps:F2} MB/s";
         }
-        public static string FormatBytes(decimal bytes)
+        public static string FormatBytes(decimal bytes,bool isIEC = false)
         {
-            string[] suffixes = ["B", "KB", "MB", "GB", "TB"];
+            string[] suffixes = isIEC ? ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB","ZiB"] : ["B", "KB", "MB", "GB", "TB", "PB", "EB","ZB"];
             int i;
-            for (i = 0; i < suffixes.Length && bytes >= 1024; i++)
+            for (i = 0; i < suffixes.Length && bytes >= (isIEC ? 1024 : 1000); i++)
             {
-                bytes /= 1024;
+                bytes /= (isIEC ? 1024 : 1000);
             }
-            return $"{bytes:F4} {suffixes[i]}";
+            return $"{bytes:F3} {suffixes[i]}";
+        }
+
+        public static string FormatBytesKB(ulong bytes)
+        {
+            if (bytes == 0)
+                return "0 KB";
+
+            ulong kb = (bytes + 1023) / 1024; // 向上取整
+            return $"{kb:N0} KB";
         }
         public static void EnsureNormalForReplace(string path)
         {

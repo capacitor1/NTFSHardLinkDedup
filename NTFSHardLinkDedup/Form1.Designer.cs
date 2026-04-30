@@ -34,6 +34,9 @@
             openHashListToolStripMenuItem = new ToolStripMenuItem();
             operationsToolStripMenuItem = new ToolStripMenuItem();
             runAsAdministratorToolStripMenuItem = new ToolStripMenuItem();
+            toolStripSeparator2 = new ToolStripSeparator();
+            UI_IsIEC = new ToolStripMenuItem();
+            UI_ViewKBOnly = new ToolStripMenuItem();
             TabCtrl = new TabControl();
             Page_Make = new TabPage();
             groupBox3 = new GroupBox();
@@ -124,7 +127,7 @@
             // 
             // operationsToolStripMenuItem
             // 
-            operationsToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { runAsAdministratorToolStripMenuItem });
+            operationsToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { runAsAdministratorToolStripMenuItem, toolStripSeparator2, UI_IsIEC, UI_ViewKBOnly });
             operationsToolStripMenuItem.Name = "operationsToolStripMenuItem";
             operationsToolStripMenuItem.Size = new Size(85, 21);
             operationsToolStripMenuItem.Text = "Operations";
@@ -132,9 +135,36 @@
             // runAsAdministratorToolStripMenuItem
             // 
             runAsAdministratorToolStripMenuItem.Name = "runAsAdministratorToolStripMenuItem";
-            runAsAdministratorToolStripMenuItem.Size = new Size(197, 22);
+            runAsAdministratorToolStripMenuItem.Size = new Size(208, 22);
             runAsAdministratorToolStripMenuItem.Text = "Run as administrator";
             runAsAdministratorToolStripMenuItem.Click += runAsAdministratorToolStripMenuItem_Click;
+            // 
+            // toolStripSeparator2
+            // 
+            toolStripSeparator2.Name = "toolStripSeparator2";
+            toolStripSeparator2.Size = new Size(205, 6);
+            // 
+            // UI_IsIEC
+            // 
+            UI_IsIEC.Checked = true;
+            UI_IsIEC.CheckOnClick = true;
+            UI_IsIEC.CheckState = CheckState.Checked;
+            UI_IsIEC.Name = "UI_IsIEC";
+            UI_IsIEC.Size = new Size(208, 22);
+            UI_IsIEC.Text = "Use IEC standard units";
+            UI_IsIEC.ToolTipText = "Check to use IEC units like MiB. Else, use SI units like MB. ";
+            UI_IsIEC.Click += UI_IsIEC_Click;
+            // 
+            // UI_ViewKBOnly
+            // 
+            UI_ViewKBOnly.Checked = true;
+            UI_ViewKBOnly.CheckOnClick = true;
+            UI_ViewKBOnly.CheckState = CheckState.Checked;
+            UI_ViewKBOnly.Name = "UI_ViewKBOnly";
+            UI_ViewKBOnly.Size = new Size(208, 22);
+            UI_ViewKBOnly.Text = "Use KB/KiB in view tab";
+            UI_ViewKBOnly.ToolTipText = "Use KB/KiB unit only to adapt to the Windows native file size display.";
+            UI_ViewKBOnly.Click += UI_ViewKBOnly_Click;
             // 
             // TabCtrl
             // 
@@ -479,9 +509,9 @@
             V_ResultsC.AutoSize = true;
             V_ResultsC.Location = new Point(6, 148);
             V_ResultsC.Name = "V_ResultsC";
-            V_ResultsC.Size = new Size(52, 17);
+            V_ResultsC.Size = new Size(144, 17);
             V_ResultsC.TabIndex = 11;
-            V_ResultsC.Text = "Results:";
+            V_ResultsC.Text = "Results: 0 (0 B, 0.000 B)";
             // 
             // V_S_Result
             // 
@@ -754,5 +784,8 @@
         private ToolStripMenuItem T_CopySize;
         private ToolStripMenuItem T_CopySizeRaw;
         private Label label5;
+        private ToolStripSeparator toolStripSeparator2;
+        private ToolStripMenuItem UI_IsIEC;
+        private ToolStripMenuItem UI_ViewKBOnly;
     }
 }

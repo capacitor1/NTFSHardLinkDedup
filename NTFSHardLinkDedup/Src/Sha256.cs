@@ -13,7 +13,7 @@ namespace NTFSHardLinkDedup.Src
         private readonly Func<bool> _isCanceled;
         private readonly int _bufferSize;
 
-        private FileStream? _fileStream;
+        private FileStream _fileStream;
         private IncrementalHash? _incrementalHash;
         private byte[]? _result;
         private bool _disposed;
@@ -25,6 +25,14 @@ namespace NTFSHardLinkDedup.Src
             _path = Path.Combine(root,path.ToString());
             _isCanceled = isCanceled ?? throw new ArgumentNullException(nameof(isCanceled));
             _bufferSize = bufferSize > 0 ? bufferSize : throw new ArgumentOutOfRangeException(nameof(bufferSize));
+            _fileStream = new FileStream(
+                    path: _path,
+                    mode: FileMode.Open,
+                    access: FileAccess.Read,
+                    share: FileShare.Read,
+                    bufferSize: _bufferSize,
+                    options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+            _flen = (ulong)_fileStream.Length;
         }
         public ulong GetFileLen()
         {
@@ -44,14 +52,7 @@ namespace NTFSHardLinkDedup.Src
             {
                 ThrowIfCanceled();
 
-                _fileStream = new FileStream(
-                    path: _path,
-                    mode: FileMode.Open,
-                    access: FileAccess.Read,
-                    share: FileShare.Read,
-                    bufferSize: _bufferSize,
-                    options: FileOptions.Asynchronous | FileOptions.SequentialScan);
-                _flen = (ulong)_fileStream.Length;
+                
                 _incrementalHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
 
                 while (true)
@@ -81,7 +82,6 @@ namespace NTFSHardLinkDedup.Src
                 ArrayPool<byte>.Shared.Return(rentedBuffer);
 
                 _fileStream?.Dispose();
-                _fileStream = null;
 
                 _incrementalHash?.Dispose();
                 _incrementalHash = null;
@@ -94,7 +94,6 @@ namespace NTFSHardLinkDedup.Src
                 return;
 
             _fileStream?.Dispose();
-            _fileStream = null;
 
             _incrementalHash?.Dispose();
             _incrementalHash = null;

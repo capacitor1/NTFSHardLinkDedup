@@ -49,10 +49,9 @@ namespace NTFSHardLinkDedup.Src
             public readonly ulong Size = size;
         }
 
-        public readonly struct SearchResult(List<HashPathPair> items, bool exceededMaxResults, int scannedHitCount)
+        public readonly struct SearchResult(List<HashPathPair> items, bool exceededMaxResults)
         {
             public readonly bool ExceededMaxResults = exceededMaxResults;
-            public readonly int ScannedHitCount = scannedHitCount;
             public readonly List<HashPathPair> Items = items;
         }
 
@@ -149,9 +148,8 @@ namespace NTFSHardLinkDedup.Src
 
             var items = new List<HashPathPair>(Math.Min(MaxResult, 256));
             if (groups.Count == 0)
-                return new SearchResult(items, false, 0);
+                return new SearchResult(items, false);
 
-            int matchedCount = 0;
             bool exceeded = false;
 
             for (int pathId = 0; pathId < _paths.Length; pathId++)
@@ -160,8 +158,6 @@ namespace NTFSHardLinkDedup.Src
 
                 if (!MatchesKeywordPattern(path, groups))
                     continue;
-
-                matchedCount++;
 
                 if (items.Count >= MaxResult)
                 {
@@ -173,7 +169,7 @@ namespace NTFSHardLinkDedup.Src
                 items.Add(new HashPathPair(entry.Hash, path, entry.Size));
             }
 
-            return new SearchResult(items, exceeded, matchedCount);
+            return new SearchResult(items, exceeded);
         }
 
         public bool TryGetEntryById(int entryId, out Hash256 hash, out ulong size, out string[]? paths)
@@ -230,12 +226,9 @@ namespace NTFSHardLinkDedup.Src
         {
             var items = new List<HashPathPair>(Math.Min(MaxResult, 256));
             bool exceeded = false;
-            int matchedCount = 0;
 
             for (int pathId = 0; pathId < _paths.Length; pathId++)
             {
-                matchedCount++;
-
                 if (items.Count >= MaxResult)
                 {
                     exceeded = true;
@@ -246,7 +239,7 @@ namespace NTFSHardLinkDedup.Src
                 items.Add(new HashPathPair(entry.Hash, _paths[pathId], entry.Size));
             }
 
-            return new SearchResult(items, exceeded, matchedCount);
+            return new SearchResult(items, exceeded);
         }
 
         private List<HashPathPair> ExpandEntryToPairs(int entryId)
